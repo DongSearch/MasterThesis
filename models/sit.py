@@ -163,6 +163,8 @@ class FinalLayer(nn.Module):
             return x, cls_token.squeeze(1)
 
 
+# main process
+
 class SiT(nn.Module):
     """
     Diffusion model with a Transformer backbone.
@@ -176,11 +178,17 @@ class SiT(nn.Module):
         hidden_size=1152,
         decoder_hidden_size=768,
         encoder_depth=8,
-        depth=28,
+        #for high-frequency block
+        high_depth=14,
+        #for low-frequency block
+        low_depth=14,
+        low_hidden_size = 512,
+        #switching threshold between low and high frequency block
+        switching_threshold = 0.5,
         num_heads=16,
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
-        num_classes=1000,
+        num_classes=10,
         use_cfg=False,
         z_dims=[768],
         projector_dim=2048,
@@ -197,6 +205,7 @@ class SiT(nn.Module):
         self.num_classes = num_classes
         self.z_dims = z_dims
         self.encoder_depth = encoder_depth
+        self.switching_threshold = switching_threshold
 
         self.x_embedder = PatchEmbed(
             input_size, patch_size, in_channels, hidden_size, bias=True
@@ -206,9 +215,14 @@ class SiT(nn.Module):
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches+1, hidden_size), requires_grad=False)
+        # high freuqency block
+        self.high_blocks = nn.ModuleList([
+            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs) for _ in range(high_depth)
+        ])
+        # low frequency block
+        self.low_blocks = nn.ModuleList([
+            SiTBlock(low_hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs) for _ in range(low_depth)
 
-        self.blocks = nn.ModuleList([
-            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs) for _ in range(depth)
         ])
         self.projectors = nn.ModuleList([
             build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims
@@ -252,9 +266,13 @@ class SiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in SiT blocks:
-        for block in self.blocks:
+        for block in self.high_blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        for block in self.low_blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
@@ -303,8 +321,12 @@ class SiT(nn.Module):
         t_embed = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t_embed + y
+        if t >= self.switching_threshold :
+          blocks = self.high_blocks
+        else :
+          blocks = self.low_blocks
 
-        for i, block in enumerate(self.blocks):
+        for i, block in enumerate(blocks):
             x = block(x, c)
             if (i + 1) == self.encoder_depth:
                 zs = [projector(x.reshape(-1, D)).reshape(N, T, -1) for projector in self.projectors]
