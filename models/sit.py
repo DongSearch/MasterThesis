@@ -224,6 +224,14 @@ class SiT(nn.Module):
             SiTBlock(low_hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs) for _ in range(low_depth)
 
         ])
+        # reduce embedding dimension too
+        self.to_low_x = nn.Linear(hidden_size,low_hidden_size)
+        self.to_low_c = nn.Linear(hidden_size,low_hidden_size)
+        self.from_low_x = nn.Linear(low_hidden_size,hidden_size)
+        # flag for checking up and downsample
+        self.is_already_downsampled = False
+        self.is_already_upsampled = False
+
         self.projectors = nn.ModuleList([
             build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims
             ])
@@ -237,6 +245,50 @@ class SiT(nn.Module):
         self.wg_norm = nn.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6)
 
         self.initialize_weights()
+    
+    def token_downsample(self,x,cls_token_present=True):
+      # Reduces L tokens to L/4 toekns.
+      # check if they have cls, they should be splited 
+      if cls_token_present:
+        cls = x[:,:1,:]
+        tokens = x[:,1:,:]
+      else:
+        tokens = x
+      
+      N,L,D = tokens.shape
+      H = W = int(L**0.5)
+      # we need to convert it to image shape and change axis for CNN
+      # noisy image might be better to use max pooling to capture rare feature pattern
+      img_x = tokens.reshape(N,H,W,D).permute(0,3,1,2) # (N,D,H,W)
+      img_x_domwsample = F.max_pool2d(img_x,kernel_size=2,stride=2)
+
+      # Reshape it to tokens
+      tokens_downsample = img_x_domwsample.permute(0,2,3,1).reshape(N,-1,D)
+      if cls_token_present:
+        return torch.cat([cls,tokens_downsample], dim = 1)
+      return tokens_downsample
+
+    def token_upsample(self,x,high_S,cls_token_present):
+      if cls_token_present:
+        cls = x[:,:1,:]
+        tokens = x[:,1:,:]
+      else:
+        tokens = x
+      
+      N,L,D = tokens.shape
+      H=W=tokens.shape
+      
+      #Reshape to image shape
+      img_x = tokens.reshape(N,H,W,D).permute(0,3,1,2) # (N,D,H,W)
+      #Upsample
+      img_x_upsample = F.interpolate(img_x, size=(high_S,high_S),mode='bilinear',align_corners=False)
+      #restore
+      tokens_upsample = img_x_upsample.permute(0,2,3,1).reshape(N,-1,D)
+      if cls_token_present:
+        return torch.cat([cls,tokens_upsample],dim=1)
+      return tokens_upsample
+
+
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -296,7 +348,7 @@ class SiT(nn.Module):
         x = torch.einsum('nhwpqc->nchpwq', x)
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
-    
+
     def forward(self, x, t, y, return_logvar=False, cls_token=None):
         """
         Forward pass of SiT.
@@ -315,21 +367,38 @@ class SiT(nn.Module):
             x = x + self.pos_embed
         else:
             exit()
-        N, T, D = x.shape
+        N, L, D = x.shape
 
         # timestep and class embedding
         t_embed = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t_embed + y
-        if t >= self.switching_threshold :
-          blocks = self.high_blocks
+
+        # to avoid redundant up-down sampling, we should check before that
+        if x.dim() ==
+
+        current_t = t[0].item()
+        if current_t <= self.switching_threshold :
+          ##high frequency
+          if not self.is_already_upsampled:
+            x = self.token_upsample(x,L*2,cls_token)
+            x = self.from_low_x(x)
+            blocks = self.high_blocks
+            self.is_already_upsampled = True
+            self.is_already_downsampled = False
         else :
-          blocks = self.low_blocks
+          if not self.is_already_downsampled:
+            x = self.to_low_x(x)
+            x = self.token_downsample(x,cls_token)
+            blocks = self.low_blocks
+            self.is_already_upsampled = False
+            self.is_already_downsampled = True
+          c = self.to_low_c(self.t_embedder(t) + self.y_embedder(y, self.training))
 
         for i, block in enumerate(blocks):
             x = block(x, c)
             if (i + 1) == self.encoder_depth:
-                zs = [projector(x.reshape(-1, D)).reshape(N, T, -1) for projector in self.projectors]
+                zs = [projector(x.reshape(-1, D)).reshape(N, L, -1) for projector in self.projectors]
 
         x, cls_token = self.final_layer(x, c, cls=cls_token)
         x = self.unpatchify(x)
