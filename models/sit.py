@@ -11,6 +11,7 @@ import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+import torch.nn.functional as F
 
 
 def build_mlp(hidden_size, projector_dim, z_dim):
@@ -111,7 +112,7 @@ class SiTBlock(nn.Module):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(
-            hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=block_kwargs["qk_norm"]
+            hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=block_kwargs.get("qk_norm",False)
             )
         if "fused_attn" in block_kwargs.keys():
             self.attn.fused_attn = block_kwargs["fused_attn"]
@@ -228,9 +229,7 @@ class SiT(nn.Module):
         self.to_low_x = nn.Linear(hidden_size,low_hidden_size)
         self.to_low_c = nn.Linear(hidden_size,low_hidden_size)
         self.from_low_x = nn.Linear(low_hidden_size,hidden_size)
-        # flag for checking up and downsample
-        self.is_already_downsampled = False
-        self.is_already_upsampled = False
+
 
         self.projectors = nn.ModuleList([
             build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims
@@ -276,7 +275,7 @@ class SiT(nn.Module):
         tokens = x
       
       N,L,D = tokens.shape
-      H=W=tokens.shape
+      H=W=int(L**0.5)
       
       #Reshape to image shape
       img_x = tokens.reshape(N,H,W,D).permute(0,3,1,2) # (N,D,H,W)
@@ -366,44 +365,66 @@ class SiT(nn.Module):
             x = torch.cat((cls_token, x), dim=1)
             x = x + self.pos_embed
         else:
-            exit()
+            pass
+            # exit()
         N, L, D = x.shape
 
         # timestep and class embedding
         t_embed = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t_embed + y
+        # need to split batch into low and high data 
+        low_batch_mask = t > self.switching_threshold
+        high_batch_mask = ~low_batch_mask
 
-        # to avoid redundant up-down sampling, we should check before that
-        if x.dim() ==
+        #output : after processing low and high images differently, concatenate them 
+        out_x = torch.zeros_like(x)
+        #define zs as well to extract feature in the middle of process
+        zs = [torch.zeros((N, L, self.z_dims[0]), device=x.device, dtype=x.dtype) for z_dim in self.z_dims]
 
-        current_t = t[0].item()
-        if current_t <= self.switching_threshold :
-          ##high frequency
-          if not self.is_already_upsampled:
-            x = self.token_upsample(x,L*2,cls_token)
-            x = self.from_low_x(x)
-            blocks = self.high_blocks
-            self.is_already_upsampled = True
-            self.is_already_downsampled = False
-        else :
-          if not self.is_already_downsampled:
-            x = self.to_low_x(x)
-            x = self.token_downsample(x,cls_token)
-            blocks = self.low_blocks
-            self.is_already_upsampled = False
-            self.is_already_downsampled = True
-          c = self.to_low_c(self.t_embedder(t) + self.y_embedder(y, self.training))
+        ##low frequency
+        if low_batch_mask.any() :
+          #extract only low frequency data from batch
+          x_low = x[low_batch_mask]
+          c_low = c[low_batch_mask]
+          # reduce dimension and resolution
+          x_low = self.to_low_x(x_low) # (N,L/4,D_low)
+          x_low = self.token_downsample(x_low, cls_token_present=True)
+          c_low = self.to_low_c(c_low)
+          # pass thorugh low block sequence
+          for i, block in enumerate(self.low_blocks):
+            x_low = block(x_low,c_low)
+            # every time they reach to certain encoder_depths, extract them for middle test
+            if(i+1) == self.encoder_depth:
+              S = int((L-1)**0.5)
+              x_low_temp = self.token_upsample(x_low,S,cls_token_present=True)
+              x_low_temp = self.from_low_x(x_low_temp)
 
-        for i, block in enumerate(blocks):
-            x = block(x, c)
-            if (i + 1) == self.encoder_depth:
-                zs = [projector(x.reshape(-1, D)).reshape(N, L, -1) for projector in self.projectors]
+              for j, projector in enumerate(self.projectors):
+                z_val = projector(x_low_temp.reshape(-1,D).reshape(-1,L,self.z_dims[j]))
+                zs[j][low_batch_mask] = z_val
+          #restore(Upsample + embedding)
+          S = int((L-1)**0.5)
+          x_low = self.token_upsample(x_low,S,cls_token_present=True)
+          x_low = self.from_low_x(x_low)
+          out_x[low_batch_mask] = x_low
+        # do same to high block 
+        if high_batch_mask.any():
+          x_high = x[high_batch_mask]
+          c_high = c[high_batch_mask]
+          for i,block in enumerate(self.high_blocks) :
+            x_high = block(x_high,c_high)
+            if(i+1) == self.encoder_depth:
+              for j, projector in enumerate(self.projectors):
+                z_val = projector(x_high.reshape(-1,D).reshape(-1,L,self.z_dims[j]))
+                zs[j][high_batch_mask] = z_val
 
-        x, cls_token = self.final_layer(x, c, cls=cls_token)
-        x = self.unpatchify(x)
+          out_x[high_batch_mask] = x_high
 
-        return x, zs, cls_token
+        x_out, cls_token = self.final_layer(out_x, c, cls=cls_token)
+        x_out = self.unpatchify(x_out)
+
+        return x_out, zs, cls_token
 
 
 #################################################################################
